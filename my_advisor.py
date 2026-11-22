@@ -9,8 +9,8 @@ from pathlib import Path
 import shutil
 import stat
 import sys
-import tempfile
 import tomllib
+import uuid
 
 
 SOURCE = Path(__file__).resolve().parent
@@ -25,6 +25,7 @@ DIRECTORIES = sorted(
 )
 STATE = ".my-advisor.json"
 GUIDANCE = "AGENTS.md"
+DEFAULT_PROJECT_DOC_MAX_BYTES = 32 * 1024
 BEGIN = b"<!-- BEGIN my-advisor -->"
 END = b"<!-- END my-advisor -->"
 
@@ -60,27 +61,30 @@ def digest(content):
 
 
 def change_file(path, before, after):
-    if before is None:
-        with path.open("xb") as output:
-            output.write(after)
-        return
     if after is None:
         if path.read_bytes() != before:
             raise Conflict(f"{path} changed during the operation.")
         path.unlink()
         return
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
-        temporary = Path(output.name)
-        try:
+    temporary = path.with_name(f".my-advisor-{uuid.uuid4().hex}.tmp")
+    mode = 0o666 if before is None else 0o600
+    output = open(temporary, "xb", opener=lambda name, flags: os.open(name, flags, mode))
+    try:
+        with output:
             output.write(after)
-            output.close()
-            shutil.copymode(path, temporary)
-            if path.read_bytes() != before:
-                raise Conflict(f"{path} changed during the operation.")
-            os.replace(temporary, path)
-        finally:
-            output.close()
-            temporary.unlink(missing_ok=True)
+        if before is None:
+            # Windows rename refuses an existing destination. On POSIX use a hard link.
+            if os.name == "nt":
+                temporary.rename(path)
+            else:
+                os.link(temporary, path)
+            return
+        shutil.copymode(path, temporary)
+        if path.read_bytes() != before:
+            raise Conflict(f"{path} changed during the operation.")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def state_bytes(state):
@@ -152,11 +156,29 @@ def check_agent_name(root):
             raise Conflict(f"Agent name my-advisor is already defined in {name}.")
 
 
+def warn_if_guidance_is_large(content):
+    if len(content) > DEFAULT_PROJECT_DOC_MAX_BYTES:
+        print(
+            f"Warning: {GUIDANCE} with the My Advisor block exceeds Codex's default 32 KiB "
+            "project instruction limit. The block may be cut off unless project_doc_max_bytes "
+            "is high enough.",
+            file=sys.stderr,
+        )
+
+
 def install(root):
     raw = read_file(root, STATE)
-    if read_file(root, "AGENTS.override.md"):
+    if read_file(root, "AGENTS.override.md") is not None:
         raise Conflict(f"AGENTS.override.md takes precedence over {GUIDANCE} in this directory.")
     original = read_file(root, GUIDANCE)
+    body = original or b""
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Conflict(f"{GUIDANCE} must be UTF-8. Kept it as is.") from error
+    if b"\0" in body:
+        raise Conflict(f"{GUIDANCE} contains NUL bytes. Save it as UTF-8 text before installing.")
+
     if raw is not None:
         state = read_state(raw)
         files_match = set(state["files"]) == set(FILES) and all(
@@ -164,6 +186,7 @@ def install(root):
         )
         record = state["guidance"]
         if files_match and record and guidance_without_block(original, record) != original:
+            warn_if_guidance_is_large(body)
             print("My Advisor is already installed.")
             return
         raise Conflict("An earlier installation is incomplete or changed. Run uninstall first.")
@@ -181,12 +204,13 @@ def install(root):
     directories = [
         name for name in DIRECTORIES if not checked_path(root, name, directory=True).exists()
     ]
-    body = original or b""
     newline = b"\r\n" if b"\r\n" in body else b"\n"
     padding = 0
     if body and not body.endswith(newline * 2):
         padding = 1 if body.endswith(b"\n") else 2
     block = (PACKAGE / "agents-block.md").read_text(encoding="utf-8").encode().replace(b"\n", newline)
+    updated_guidance = body + newline * padding + block
+    warn_if_guidance_is_large(updated_guidance)
     state = {
         "format": 1,
         "package": "my-advisor",
@@ -205,7 +229,7 @@ def install(root):
         (root / name).mkdir()
     for name, content in assets.items():
         change_file(root / name, None, content)
-    change_file(root / GUIDANCE, original, body + newline * padding + block)
+    change_file(root / GUIDANCE, original, updated_guidance)
     print(f"Installed My Advisor in {root}")
 
 
